@@ -1,98 +1,85 @@
-name: Deploy develop preview
+name: Deploy preview
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: '7,17,27,37,47,57 * * * *'
+    inputs:
+      source_ref:
+        description: Source branch or commit from gitmaruneko/yuban
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
   group: preview-pages
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    outputs:
-      changed: ${{ steps.version.outputs.changed }}
+    env:
+      SOURCE_REF: ${{ inputs.source_ref }}
     steps:
-      - name: Checkout develop source
+      - name: Checkout source
         uses: actions/checkout@v5
         with:
           repository: gitmaruneko/yuban
-          ref: develop
+          ref: ${{ inputs.source_ref }}
           persist-credentials: false
 
-      - name: Check published version
-        id: version
-        env:
-          EVENT_NAME: ${{ github.event_name }}
+      - name: Record source version
         run: |
           source_sha="$(git rev-parse HEAD)"
-          published_sha="$(curl --fail --silent --show-error --max-time 20 'https://gitmaruneko.github.io/yuban-preview/preview-version.txt' || true)"
           echo "SOURCE_SHA=$source_sha" >> "$GITHUB_ENV"
-          if [ "$EVENT_NAME" = "schedule" ] && [ "$source_sha" = "$published_sha" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Preview already matches develop ($source_sha)." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
+          echo "Preview source: $SOURCE_REF ($source_sha)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Python
-        if: steps.version.outputs.changed == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.x'
 
       - name: Install Python dependencies
-        if: steps.version.outputs.changed == 'true'
         run: python -m pip install -r requirements.txt
 
       - name: Run Python unit tests
-        if: steps.version.outputs.changed == 'true'
         run: python -m unittest discover -s tests -v
 
       - name: Run JavaScript unit tests
-        if: steps.version.outputs.changed == 'true'
         run: node --test tests/search-utils.test.mjs
 
       - name: Validate resource index
-        if: steps.version.outputs.changed == 'true'
         run: python tools/validate_resources.py
 
       - name: Prepare preview
-        if: steps.version.outputs.changed == 'true'
         run: |
           python - <<'PY'
+          import html
           import os
           import re
           from pathlib import Path
 
           site = Path("website")
+          source_ref = os.environ["SOURCE_REF"]
           sha = os.environ["SOURCE_SHA"]
           (site / "preview-version.txt").write_text(sha + "\n", encoding="utf-8")
+          (site / "preview-ref.txt").write_text(source_ref + "\n", encoding="utf-8")
           (site / "robots.txt").write_text("User-agent: *\nDisallow: /\n", encoding="utf-8")
-          banner = '<div role="note" style="padding:10px;text-align:center;background:#fff3cd;color:#332701">開發預覽版 · develop · ' + sha[:7] + ' ｜ <a href="https://gitmaruneko.github.io/yuban/">前往正式網站</a></div>'
+          banner = '<div role="note" style="padding:10px;text-align:center;background:#fff3cd;color:#332701">開發預覽版 · ' + html.escape(source_ref) + ' · ' + sha[:7] + ' ｜ <a href="https://gitmaruneko.github.io/yuban/">前往正式網站</a></div>'
           for page in site.rglob("*.html"):
-              html = page.read_text(encoding="utf-8")
-              html = re.sub(r"(<head\b[^>]*>)", r'\1<meta name="robots" content="noindex,nofollow">', html, count=1, flags=re.I)
-              html = re.sub(r"(<body\b[^>]*>)", lambda match: match.group(1) + banner, html, count=1, flags=re.I)
-              page.write_text(html, encoding="utf-8")
+              page_html = page.read_text(encoding="utf-8")
+              page_html = re.sub(r"(<head\b[^>]*>)", r'\1<meta name="robots" content="noindex,nofollow">', page_html, count=1, flags=re.I)
+              page_html = re.sub(r"(<body\b[^>]*>)", lambda match: match.group(1) + banner, page_html, count=1, flags=re.I)
+              page.write_text(page_html, encoding="utf-8")
           PY
 
       - name: Upload preview artifact
-        if: steps.version.outputs.changed == 'true'
         uses: actions/upload-pages-artifact@v5
         with:
           path: website
 
   deploy:
     needs: build
-    if: needs.build.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       pages: write
@@ -107,6 +94,6 @@ jobs:
 
       - name: Check deployed pages
         run: |
-          for path in index.html learning-materials/index.html data/sample-resources.json preview-version.txt; do
+          for path in index.html learning-materials/index.html data/sample-resources.json preview-version.txt preview-ref.txt; do
             curl --fail --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors --max-time 30 "https://gitmaruneko.github.io/yuban-preview/$path" --output /dev/null
           done
